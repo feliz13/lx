@@ -1,0 +1,11 @@
+{
+  "id": "lanxin-voice-transcribe",
+  "name": "lanxin-stt-tts",
+  "version": "1.0.0",
+  "description": "Lanxin voice STT (ElevenLabs Scribe) + TTS (ElevenLabs v3) with smart voice reply via lxfile",
+  "author": "Qianxin AI",
+  "emoji": "🎙️",
+  "homepage": "https://elevenlabs.io",
+  "requires": { "env": ["ELEVENLABS_API_KEY"] },
+  "capabilities": { "channels": ["lanxin"] }
+}

@@ -1,0 +1,29 @@
+{
+  "name": "lanxin-stt-tts",
+  "version": "1.0.0",
+  "description": "Lanxin voice STT + TTS: auto-transcribe voice messages + smart voice reply via lxfile",
+  "keywords": [
+    "lanxin",
+    "openclaw",
+    "plugin",
+    "stt",
+    "transcription",
+    "tts",
+    "voice"
+  ],
+  "license": "MIT",
+  "author": "Qianxin AI",
+  "type": "commonjs",
+  "main": "index.js",
+  "clawdbot": {
+    "emoji": "🎙️",
+    "requires": {
+      "env": [
+        "ELEVENLABS_API_KEY"
+      ]
+    },
+    "extensions": [
+      "./index.js"
+    ]
+  }
+}
