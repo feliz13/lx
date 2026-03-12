@@ -285,11 +285,22 @@ async function processLanxinEvent(evt: LanxinCallbackEvent, target: WebhookTarge
   const eventType = evt.eventType ?? evt.msgType ?? "";
   const { account, config, runtime, core } = target;
   const data = evt.data as Record<string, unknown> | undefined;
+  
+  // Handle bot_group_message and bot_private_message events
+  const isBotGroupMessage = eventType === "bot_group_message";
+  const isBotPrivateMessage = eventType === "bot_private_message";
+  
+  // For bot events, extract from the event data directly
   const senderId = String(
-    evt.fromUserId ?? evt.from ?? data?.FromStaffId ?? data?.from ?? "",
+    data?.from ?? evt.fromUserId ?? evt.from ?? data?.FromStaffId ?? "",
   ).trim();
-  const chatId = String(evt.chatId ?? evt.toUserId ?? evt.to ?? "").trim();
-  const isGroup = Boolean(evt.chatId) || /^group|chat/i.test(chatId);
+  // For bot_group_message, use groupId as chatId
+  const chatId = String(
+    data?.groupId ?? evt.groupId ?? evt.chatId ?? evt.toUserId ?? evt.to ?? "",
+  ).trim();
+  const entryId = String(data?.entryId ?? evt.entryId ?? "").trim();
+  
+  const isGroup = Boolean(evt.groupId || data?.groupId || evt.chatId) || /^group|chat/i.test(chatId);
   const rawBody = extractMessageContent(evt);
 
   if (!/message|msg|text|file|image|voice/i.test(eventType) && !evt.content) {
@@ -611,6 +622,8 @@ export function monitorLanxinProvider(options: LanxinMonitorOptions): () => void
     webhookUrl: options.webhookUrl,
     defaultPath: "/api/channels/lanxin/webhook",
   });
+  console.log(`[${options.account.accountId}] RESOLVED webhookPath: ${webhookPath} (webhookPath=${options.webhookPath}, webhookUrl=${options.webhookUrl})`);
+  options.runtime.log?.(`[${options.account.accountId}] RESOLVED webhookPath: ${webhookPath} (from webhookPath=${options.webhookPath}, webhookUrl=${options.webhookUrl})`);
   if (!webhookPath) {
     options.runtime.error?.(`[${options.account.accountId}] invalid webhook path`);
     return () => {};

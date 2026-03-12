@@ -60,8 +60,13 @@ export type LanxinCallbackEvent = {
   timestamp?: number;
   fromUserId?: string;
   toUserId?: string;
+  from?: string;
+  groupId?: string;
+  entryId?: string;
   chatId?: string;
   msgType?: string;
   content?: string;
+  msgData?: unknown;
+  data?: unknown;
   [key: string]: unknown;
 };

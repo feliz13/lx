@@ -12,7 +12,12 @@ const plugin = {
   register(api: OpenClawPluginApi) {
     setLanxinRuntime(api.runtime);
     api.registerChannel({ plugin: lanxinPlugin, dock: lanxinDock });
-    api.registerHttpHandler(handleLanxinWebhookRequest);
+    api.registerHttpRoute({
+      path: "/lanxin",
+      auth: "plugin",
+      match: "prefix",
+      handler: handleLanxinWebhookRequest,
+    });
   },
 };
 

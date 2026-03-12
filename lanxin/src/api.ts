@@ -295,6 +295,14 @@ export async function sendLanxinPrivateMessage(params: {
   return { ok: false, errCode: json.errCode, errMsg };
 }
 
+/**
+ * 智能机器人发送群消息
+ * 文档: https://developer.lanxin.cn/official/article?article_id=646eda563d4e4adb7039c151
+ * - 路径: /v1/messages/group/create
+ * - 鉴权: app_token 作为 query 参数
+ * - 请求体: groupId, outlines, entryId, msgType, msgData
+ * - 当 user_token 不为空时，以人员身份发送群消息
+ */
 export async function sendLanxinGroupMessage(params: {
   account: ResolvedLanxinAccount;
   token: string;
@@ -303,38 +311,46 @@ export async function sendLanxinGroupMessage(params: {
   content: string;
   mediaType?: 1 | 2 | 3;
   mediaIds?: string[];
+  entryId?: string;
 }): Promise<LanxinApiResult<unknown>> {
-  const { account, token, chatId, msgType, content, mediaType, mediaIds } = params;
+  const { account, token, chatId, msgType, content, mediaType, mediaIds, entryId } = params;
   const gatewayUrl = account.config.gatewayUrl?.replace(/\/+$/, "");
 
   if (!gatewayUrl) {
     return { ok: false, errMsg: "gatewayUrl not configured" };
   }
 
-  const textPayload: Record<string, unknown> = { text: content.slice(0, 4000) };
+  const path = account.config.sendGroupMsgPath ?? "/v1/messages/group/create";
+  const url = `${gatewayUrl}${path.startsWith("/") ? "" : "/"}${path}?app_token=${encodeURIComponent(token)}`;
+
+  const textPayload: Record<string, unknown> = { content: content.slice(0, 4000) };
   if (mediaType != null && mediaIds != null && mediaIds.length > 0) {
     textPayload.mediaType = mediaType;
     textPayload.mediaIds = mediaIds;
   }
 
-  const path = account.config.sendGroupMsgPath ?? "/v1/bot/sendGroupMsg";
-  const url = `${gatewayUrl}${path.startsWith("/") ? "" : "/"}${path}`;
+  const body: Record<string, unknown> = {
+    groupId: chatId,
+    msgType,
+    msgData: { [msgType]: textPayload },
+  };
+
+  if (entryId) {
+    body.entryId = entryId;
+  }
+
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-    body: JSON.stringify({
-      chatId,
-      msgType,
-      content: textPayload,
-    }),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
   });
 
-  const json = await parseJsonOrThrow<{ errCode?: number; errMsg?: string }>(
+  const json = await parseJsonOrThrow<{ errCode?: number; errMsg?: string; data?: { msgId?: string } }>(
     res,
     "蓝信 sendGroupMsg",
   );
   if (json.errCode === 0) {
-    return { ok: true, data: json };
+    return { ok: true, data: json.data?.msgId };
   }
   return { ok: false, errCode: json.errCode, errMsg: json.errMsg };
 }
