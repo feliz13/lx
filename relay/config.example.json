@@ -1,0 +1,14 @@
+{
+  "secret": "lx-relay-s3cret!",
+  "httpAddr": ":8088",
+  "wsAddr": ":8087",
+  "accounts": {
+    "mycw": {
+      "appId": "your-app-id",
+      "appSecret": "your-app-secret",
+      "gatewayUrl": "https://apigw.lanxin.cn",
+      "callbackKey": "your-callback-aes-key",
+      "callbackSignToken": "your-callback-sign-token"
+    }
+  }
+}

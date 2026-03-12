@@ -21,4 +21,5 @@ type Message struct {
 	Status  int               `json:"status,omitempty"`
 	Secret  string            `json:"secret,omitempty"`
 	Error   string            `json:"error,omitempty"`
+	OpenIds []string          `json:"openIds,omitempty"`
 }

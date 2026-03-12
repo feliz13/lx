@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -11,19 +10,23 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"context"
+
 	"github.com/gorilla/websocket"
 
+	"lx-relay/internal/config"
+	"lx-relay/internal/crypto"
+	"lx-relay/internal/lanxin"
 	"lx-relay/protocol"
 )
 
 var (
-	httpAddr = flag.String("http-addr", envOr("LX_HTTP_ADDR", ":8088"), "HTTP listen address for Lanxin callbacks")
-	wsAddr   = flag.String("ws-addr", envOr("LX_WS_ADDR", ":8087"), "WebSocket listen address for relay client")
-	secret   = flag.String("secret", envOr("LX_RELAY_SECRET", "lx-relay-s3cret!"), "Shared authentication secret")
+	configPath = flag.String("config", envOr("LX_RELAY_CONFIG", "config.json"), "Path to config file")
 )
 
 func envOr(key, fallback string) string {
@@ -43,28 +46,105 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-// relay holds the state for a single connected client.
-type relay struct {
-	secret string
+// ── Event parsing ───────────────────────────────────────────────────────
 
-	mu      sync.RWMutex
+type callbackPayload struct {
+	AppId  string          `json:"appId"`
+	OrgId  string          `json:"orgId"`
+	Events []callbackEvent `json:"events"`
+}
+
+type callbackEvent struct {
+	ID        string    `json:"id"`
+	EventType string    `json:"eventType"`
+	Data      eventData `json:"data"`
+}
+
+type eventData struct {
+	From    string          `json:"from"`
+	GroupId string          `json:"groupId"`
+	EntryId string          `json:"entryId"`
+	MsgType string          `json:"msgType"`
+	MsgData json.RawMessage `json:"msgData"`
+}
+
+type routeResult struct {
+	eventType string // "bot_private_message" or "bot_group_message"
+	routeKey  string // the openId to look up (from or groupId)
+	from      string // sender
+	groupId   string // group ID (empty for private)
+	account   *config.AccountConfig
+}
+
+// ── Client connection ───────────────────────────────────────────────────
+
+type clientConn struct {
 	conn    *websocket.Conn
 	writeMu sync.Mutex
 	done    chan struct{}
+	openIds []string
+}
+
+func (c *clientConn) writeJSON(v any) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.conn.WriteJSON(v)
+}
+
+// ── Relay server ────────────────────────────────────────────────────────
+
+type relay struct {
+	cfg *config.ServerConfig
+
+	mu      sync.RWMutex
+	clients map[*clientConn]struct{}
+	idIndex map[string]*clientConn // openId → client
 
 	pendingMu sync.Mutex
 	pending   map[string]chan protocol.Message
 }
 
-func newRelay(secret string) *relay {
+func newRelay(cfg *config.ServerConfig) *relay {
 	return &relay{
-		secret:  secret,
-		done:    make(chan struct{}),
+		cfg:     cfg,
+		clients: make(map[*clientConn]struct{}),
+		idIndex: make(map[string]*clientConn),
 		pending: make(map[string]chan protocol.Message),
 	}
 }
 
-// ── WebSocket handler (relay client connects here) ──────────────────────
+func (r *relay) registerClient(c *clientConn) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.clients[c] = struct{}{}
+	for _, id := range c.openIds {
+		if old, exists := r.idIndex[id]; exists && old != c {
+			log.Printf("[ws] openId %q re-registered from %s to %s", id, old.conn.RemoteAddr(), c.conn.RemoteAddr())
+		}
+		r.idIndex[id] = c
+	}
+	log.Printf("[ws] registered client %s with openIds=%v (total clients=%d)", c.conn.RemoteAddr(), c.openIds, len(r.clients))
+}
+
+func (r *relay) unregisterClient(c *clientConn) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.clients, c)
+	for _, id := range c.openIds {
+		if r.idIndex[id] == c {
+			delete(r.idIndex, id)
+		}
+	}
+	log.Printf("[ws] unregistered client %s (total clients=%d)", c.conn.RemoteAddr(), len(r.clients))
+}
+
+func (r *relay) findClient(openId string) *clientConn {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.idIndex[openId]
+}
+
+// ── WebSocket handler ───────────────────────────────────────────────────
 
 func (r *relay) handleWS(w http.ResponseWriter, req *http.Request) {
 	conn, err := upgrader.Upgrade(w, req, nil)
@@ -81,57 +161,54 @@ func (r *relay) handleWS(w http.ResponseWriter, req *http.Request) {
 		conn.Close()
 		return
 	}
-	if authMsg.Type != protocol.MsgTypeAuth || authMsg.Secret != r.secret {
+	if authMsg.Type != protocol.MsgTypeAuth || authMsg.Secret != r.cfg.Secret {
 		_ = conn.WriteJSON(protocol.Message{Type: protocol.MsgTypeAuthFail, Error: "invalid secret"})
 		conn.Close()
 		log.Printf("[ws] auth failed from %s", conn.RemoteAddr())
 		return
 	}
+	if len(authMsg.OpenIds) == 0 {
+		_ = conn.WriteJSON(protocol.Message{Type: protocol.MsgTypeAuthFail, Error: "openIds required"})
+		conn.Close()
+		log.Printf("[ws] auth rejected (no openIds) from %s", conn.RemoteAddr())
+		return
+	}
+
 	_ = conn.WriteJSON(protocol.Message{Type: protocol.MsgTypeAuthOK})
 	conn.SetReadDeadline(time.Time{})
-	log.Printf("[ws] client authenticated")
+	log.Printf("[ws] client authenticated, openIds=%v", authMsg.OpenIds)
 
-	r.mu.Lock()
-	if r.conn != nil {
-		log.Printf("[ws] replacing previous client")
-		_ = r.conn.Close()
-		close(r.done)
+	c := &clientConn{
+		conn:    conn,
+		done:    make(chan struct{}),
+		openIds: authMsg.OpenIds,
 	}
-	r.conn = conn
-	r.done = make(chan struct{})
-	done := r.done
-	r.mu.Unlock()
+	r.registerClient(c)
 
-	go r.readLoop(conn, done)
-	go r.pingLoop(conn, done)
+	go r.readLoop(c)
+	go r.pingLoop(c)
 }
 
-func (r *relay) readLoop(conn *websocket.Conn, done chan struct{}) {
+func (r *relay) readLoop(c *clientConn) {
 	defer func() {
-		r.mu.Lock()
-		if r.conn == conn {
-			r.conn = nil
-			close(r.done)
-		}
-		r.mu.Unlock()
-		_ = conn.Close()
-		log.Printf("[ws] client disconnected")
+		r.unregisterClient(c)
+		close(c.done)
+		_ = c.conn.Close()
 	}()
 
-	conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+	c.conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 	for {
 		var msg protocol.Message
-		if err := conn.ReadJSON(&msg); err != nil {
+		if err := c.conn.ReadJSON(&msg); err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-				log.Printf("[ws] read error: %v", err)
+				log.Printf("[ws] read error from %s: %v", c.conn.RemoteAddr(), err)
 			}
 			return
 		}
-		conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+		c.conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 
 		switch msg.Type {
 		case protocol.MsgTypePong:
-			// heartbeat OK
 		case protocol.MsgTypeHTTPResponse:
 			r.pendingMu.Lock()
 			ch, ok := r.pending[msg.ID]
@@ -143,46 +220,32 @@ func (r *relay) readLoop(conn *websocket.Conn, done chan struct{}) {
 				ch <- msg
 			}
 		default:
-			log.Printf("[ws] unknown message type: %s", msg.Type)
+			log.Printf("[ws] unknown message type from %s: %s", c.conn.RemoteAddr(), msg.Type)
 		}
 	}
 }
 
-func (r *relay) pingLoop(conn *websocket.Conn, done chan struct{}) {
+func (r *relay) pingLoop(c *clientConn) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-done:
+		case <-c.done:
 			return
 		case <-ticker.C:
-			r.writeMu.Lock()
-			err := conn.WriteJSON(protocol.Message{Type: protocol.MsgTypePing})
-			r.writeMu.Unlock()
-			if err != nil {
-				log.Printf("[ws] ping write error: %v", err)
+			if err := c.writeJSON(protocol.Message{Type: protocol.MsgTypePing}); err != nil {
+				log.Printf("[ws] ping write error to %s: %v", c.conn.RemoteAddr(), err)
 				return
 			}
 		}
 	}
 }
 
-// ── HTTP handler (Lanxin callbacks arrive here) ─────────────────────────
+// ── HTTP callback handler ───────────────────────────────────────────────
 
 func (r *relay) handleCallback(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	r.mu.RLock()
-	conn := r.conn
-	done := r.done
-	r.mu.RUnlock()
-
-	if conn == nil {
-		log.Printf("[http] no client connected, returning default OK")
-		writeJSON(w, http.StatusOK, `{"errCode":0,"errMsg":"ok"}`)
 		return
 	}
 
@@ -193,6 +256,108 @@ func (r *relay) handleCallback(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	timestamp := req.URL.Query().Get("timestamp")
+	nonce := req.URL.Query().Get("nonce")
+	signature := req.URL.Query().Get("dev_data_signature")
+	if signature == "" {
+		signature = req.URL.Query().Get("signature")
+	}
+
+	var bodyJSON struct {
+		Encrypt     string `json:"encrypt"`
+		DataEncrypt string `json:"dataEncrypt"`
+		EncryptCap  string `json:"Encrypt"`
+	}
+	_ = json.Unmarshal(body, &bodyJSON)
+	dataEncrypt := bodyJSON.Encrypt
+	if dataEncrypt == "" {
+		dataEncrypt = bodyJSON.DataEncrypt
+	}
+	if dataEncrypt == "" {
+		dataEncrypt = bodyJSON.EncryptCap
+	}
+	if dataEncrypt == "" {
+		log.Printf("[http] no encrypt/dataEncrypt in payload")
+		writeJSON(w, http.StatusOK, `{"errCode":0,"errMsg":"ok"}`)
+		return
+	}
+
+	route := r.resolveRoute(dataEncrypt, timestamp, nonce, signature)
+	if route == nil {
+		log.Printf("[http] signature verification failed for all accounts")
+		writeJSON(w, http.StatusOK, `{"errCode":0,"errMsg":"ok"}`)
+		return
+	}
+
+	log.Printf("[http] event: type=%s from=%s groupId=%s routeKey=%s",
+		route.eventType, route.from, route.groupId, route.routeKey)
+
+	if route.eventType == "" {
+		log.Printf("[http] no routable event type, ignoring")
+		writeJSON(w, http.StatusOK, `{"errCode":0,"errMsg":"ok"}`)
+		return
+	}
+
+	client := r.findClient(route.routeKey)
+	if client == nil {
+		log.Printf("[http] no client for routeKey=%s, sending error reply", route.routeKey)
+		go r.replyNoHandler(route)
+		writeJSON(w, http.StatusOK, `{"errCode":0,"errMsg":"ok"}`)
+		return
+	}
+
+	r.forwardToClient(w, req, body, client)
+}
+
+func (r *relay) resolveRoute(dataEncrypt, timestamp, nonce, signature string) *routeResult {
+	for name, acc := range r.cfg.Accounts {
+		if signature != "" && !crypto.VerifySignature(acc.CallbackSignToken, timestamp, nonce, dataEncrypt, signature) {
+			continue
+		}
+
+		decrypted, err := crypto.DecryptPayload(dataEncrypt, acc.CallbackKey)
+		if err != nil {
+			log.Printf("[http] decrypt failed with account %q: %v", name, err)
+			continue
+		}
+		log.Printf("[http] decrypted with account %q: %s", name, truncate(decrypted, 500))
+
+		var payload callbackPayload
+		if err := json.Unmarshal([]byte(decrypted), &payload); err != nil {
+			log.Printf("[http] parse decrypted JSON failed: %v", err)
+			continue
+		}
+
+		for _, evt := range payload.Events {
+			switch evt.EventType {
+			case "bot_private_message":
+				if evt.Data.From != "" {
+					return &routeResult{
+						eventType: evt.EventType,
+						routeKey:  evt.Data.From,
+						from:      evt.Data.From,
+						account:   acc,
+					}
+				}
+			case "bot_group_message":
+				if evt.Data.GroupId != "" {
+					return &routeResult{
+						eventType: evt.EventType,
+						routeKey:  evt.Data.GroupId,
+						from:      evt.Data.From,
+						groupId:   evt.Data.GroupId,
+						account:   acc,
+					}
+				}
+			}
+		}
+
+		return &routeResult{account: acc}
+	}
+	return nil
+}
+
+func (r *relay) forwardToClient(w http.ResponseWriter, req *http.Request, body []byte, client *clientConn) {
 	headers := make(map[string]string, len(req.Header))
 	for k := range req.Header {
 		headers[k] = req.Header.Get(k)
@@ -220,16 +385,13 @@ func (r *relay) handleCallback(w http.ResponseWriter, req *http.Request) {
 		r.pendingMu.Unlock()
 	}()
 
-	r.writeMu.Lock()
-	wErr := conn.WriteJSON(msg)
-	r.writeMu.Unlock()
-	if wErr != nil {
-		log.Printf("[http] ws write error: %v", wErr)
+	if err := client.writeJSON(msg); err != nil {
+		log.Printf("[http] ws write error to %s: %v", client.conn.RemoteAddr(), err)
 		writeJSON(w, http.StatusOK, `{"errCode":0,"errMsg":"ok"}`)
 		return
 	}
 
-	log.Printf("[http] forwarded %s %s -> %s", req.Method, req.URL.Path, reqID)
+	log.Printf("[http] forwarded %s %s -> %s (client=%s)", req.Method, req.URL.Path, reqID, client.conn.RemoteAddr())
 
 	select {
 	case resp := <-ch:
@@ -239,7 +401,7 @@ func (r *relay) handleCallback(w http.ResponseWriter, req *http.Request) {
 		}
 		writeJSON(w, status, resp.Body)
 		log.Printf("[http] responded %s status=%d", reqID, status)
-	case <-done:
+	case <-client.done:
 		log.Printf("[http] client disconnected while waiting for %s", reqID)
 		writeJSON(w, http.StatusOK, `{"errCode":0,"errMsg":"ok"}`)
 	case <-time.After(2500 * time.Millisecond):
@@ -248,19 +410,60 @@ func (r *relay) handleCallback(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+func (r *relay) replyNoHandler(route *routeResult) {
+	token, err := lanxin.GetAppToken(route.account)
+	if err != nil {
+		log.Printf("[reply] get token failed: %v", err)
+		return
+	}
+
+	msg := "抱歉，当前没有可用的服务处理您的消息。"
+
+	switch route.eventType {
+	case "bot_private_message":
+		if err := lanxin.SendPrivateMessage(route.account, token, route.from, msg); err != nil {
+			log.Printf("[reply] send private message to %s failed: %v", route.from, err)
+		} else {
+			log.Printf("[reply] sent 'no handler' to user %s", route.from)
+		}
+	case "bot_group_message":
+		if err := lanxin.SendGroupMessage(route.account, token, route.groupId, msg); err != nil {
+			log.Printf("[reply] send group message to %s failed: %v", route.groupId, err)
+		} else {
+			log.Printf("[reply] sent 'no handler' to group %s", route.groupId)
+		}
+	}
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────
+
 func writeJSON(w http.ResponseWriter, status int, body string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write([]byte(body))
 }
 
-// ── Healthcheck ─────────────────────────────────────────────────────────
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
+}
 
 func (r *relay) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	r.mu.RLock()
-	connected := r.conn != nil
+	clientCount := len(r.clients)
+	ids := make([]string, 0, len(r.idIndex))
+	for id := range r.idIndex {
+		ids = append(ids, id)
+	}
 	r.mu.RUnlock()
-	resp := map[string]any{"ok": true, "clientConnected": connected}
+
+	resp := map[string]any{
+		"ok":             true,
+		"clientCount":    clientCount,
+		"registeredIds":  ids,
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
 }
@@ -271,25 +474,37 @@ func main() {
 	flag.Parse()
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
-	r := newRelay(*secret)
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		log.Fatalf("load config: %v", err)
+	}
+	log.Printf("loaded %d account(s) from %s", len(cfg.Accounts), *configPath)
+
+	accountList := make([]string, 0, len(cfg.Accounts))
+	for name := range cfg.Accounts {
+		accountList = append(accountList, name)
+	}
+	log.Printf("accounts: %s", strings.Join(accountList, ", "))
+
+	r := newRelay(cfg)
 
 	wsMux := http.NewServeMux()
 	wsMux.HandleFunc("/ws", r.handleWS)
-	wsServer := &http.Server{Addr: *wsAddr, Handler: wsMux}
+	wsServer := &http.Server{Addr: cfg.WsAddr, Handler: wsMux}
 
 	httpMux := http.NewServeMux()
 	httpMux.HandleFunc("/health", r.handleHealth)
 	httpMux.HandleFunc("/", r.handleCallback)
-	httpServer := &http.Server{Addr: *httpAddr, Handler: httpMux}
+	httpServer := &http.Server{Addr: cfg.HttpAddr, Handler: httpMux}
 
 	go func() {
-		log.Printf("WebSocket server listening on %s", *wsAddr)
+		log.Printf("WebSocket server listening on %s", cfg.WsAddr)
 		if err := wsServer.ListenAndServe(); err != http.ErrServerClosed {
 			log.Fatalf("ws server: %v", err)
 		}
 	}()
 	go func() {
-		log.Printf("HTTP callback server listening on %s", *httpAddr)
+		log.Printf("HTTP callback server listening on %s", cfg.HttpAddr)
 		if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
 			log.Fatalf("http server: %v", err)
 		}

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -20,8 +21,9 @@ import (
 
 var (
 	serverURL = flag.String("server", envOr("LX_RELAY_SERVER", "ws://localhost:8087/ws"), "Relay server WebSocket URL")
-	target    = flag.String("target", envOr("LX_RELAY_TARGET", "http://localhost:18789"), "Local OpenClaw base URL (path is preserved from original request)")
+	target    = flag.String("target", envOr("LX_RELAY_TARGET", "http://localhost:18789"), "Local OpenClaw base URL")
 	secret    = flag.String("secret", envOr("LX_RELAY_SECRET", "lx-relay-s3cret!"), "Shared authentication secret")
+	openIds   = flag.String("open-ids", envOr("LX_RELAY_OPEN_IDS", ""), "Comma-separated list of openIds to register (user or group IDs)")
 )
 
 func envOr(key, fallback string) string {
@@ -31,10 +33,22 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
+func parseOpenIds(raw string) []string {
+	var ids []string
+	for _, s := range strings.Split(raw, ",") {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			ids = append(ids, s)
+		}
+	}
+	return ids
+}
+
 type client struct {
 	serverURL string
 	target    string
 	secret    string
+	openIds   []string
 
 	conn    *websocket.Conn
 	writeMu sync.Mutex
@@ -48,8 +62,9 @@ func (c *client) connect() error {
 	}
 
 	if err := conn.WriteJSON(protocol.Message{
-		Type:   protocol.MsgTypeAuth,
-		Secret: c.secret,
+		Type:    protocol.MsgTypeAuth,
+		Secret:  c.secret,
+		OpenIds: c.openIds,
 	}); err != nil {
 		conn.Close()
 		return fmt.Errorf("auth write: %w", err)
@@ -73,7 +88,7 @@ func (c *client) connect() error {
 	}
 
 	c.conn = conn
-	log.Printf("[ws] connected to %s", c.serverURL)
+	log.Printf("[ws] connected to %s (openIds=%v)", c.serverURL, c.openIds)
 	return nil
 }
 
@@ -149,10 +164,16 @@ func main() {
 	flag.Parse()
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
+	ids := parseOpenIds(*openIds)
+	if len(ids) == 0 {
+		log.Fatal("-open-ids is required (comma-separated list of user/group openIds)")
+	}
+
 	c := &client{
 		serverURL: *serverURL,
 		target:    *target,
 		secret:    *secret,
+		openIds:   ids,
 	}
 
 	quit := make(chan os.Signal, 1)
