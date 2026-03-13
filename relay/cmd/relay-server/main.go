@@ -322,32 +322,31 @@ func (r *relay) resolveRoute(dataEncrypt, timestamp, nonce, signature string) *r
 		}
 		log.Printf("[http] decrypted with account %q: %s", name, truncate(decrypted, 500))
 
-		var payload callbackPayload
-		if err := json.Unmarshal([]byte(decrypted), &payload); err != nil {
+		// The decrypted data is a single event, not wrapped in an "events" array
+		var evt callbackEvent
+		if err := json.Unmarshal([]byte(decrypted), &evt); err != nil {
 			log.Printf("[http] parse decrypted JSON failed: %v", err)
 			continue
 		}
 
-		for _, evt := range payload.Events {
-			switch evt.EventType {
-			case "bot_private_message":
-				if evt.Data.From != "" {
-					return &routeResult{
-						eventType: evt.EventType,
-						routeKey:  evt.Data.From,
-						from:      evt.Data.From,
-						account:   acc,
-					}
+		switch evt.EventType {
+		case "bot_private_message":
+			if evt.Data.From != "" {
+				return &routeResult{
+					eventType: evt.EventType,
+					routeKey:  evt.Data.From,
+					from:      evt.Data.From,
+					account:   acc,
 				}
-			case "bot_group_message":
-				if evt.Data.GroupId != "" {
-					return &routeResult{
-						eventType: evt.EventType,
-						routeKey:  evt.Data.GroupId,
-						from:      evt.Data.From,
-						groupId:   evt.Data.GroupId,
-						account:   acc,
-					}
+			}
+		case "bot_group_message":
+			if evt.Data.GroupId != "" {
+				return &routeResult{
+					eventType: evt.EventType,
+					routeKey:  evt.Data.GroupId,
+					from:      evt.Data.From,
+					groupId:   evt.Data.GroupId,
+					account:   acc,
 				}
 			}
 		}
@@ -460,9 +459,9 @@ func (r *relay) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	r.mu.RUnlock()
 
 	resp := map[string]any{
-		"ok":             true,
-		"clientCount":    clientCount,
-		"registeredIds":  ids,
+		"ok":            true,
+		"clientCount":   clientCount,
+		"registeredIds": ids,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
