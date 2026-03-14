@@ -10,6 +10,9 @@ export type LanxinApiResult<T> = { ok: true; data: T } | LanxinApiError;
 
 const APP_TOKEN_CACHE = new Map<string, { token: string; expiresAt: number }>();
 
+const STAFF_NAME_CACHE = new Map<string, { name: string; expiresAt: number }>();
+const STAFF_NAME_CACHE_TTL_MS = 60 * 60 * 1000;
+
 function cacheKey(account: ResolvedLanxinAccount): string {
   return `${account.accountId}:${account.config.appId}`;
 }
@@ -353,4 +356,48 @@ export async function sendLanxinGroupMessage(params: {
     return { ok: true, data: json.data?.msgId };
   }
   return { ok: false, errCode: json.errCode, errMsg: json.errMsg };
+}
+
+/**
+ * 根据 openid 获取人员姓名，结果缓存 1 小时
+ * 文档: GET /v1/staffs/:staffid/fetch?app_token=APP_TOKEN
+ */
+export async function fetchLanxinStaffName(params: {
+  account: ResolvedLanxinAccount;
+  openId: string;
+}): Promise<string | null> {
+  const { account, openId } = params;
+  if (!openId) return null;
+
+  const key = `${cacheKey(account)}:${openId}`;
+  const cached = STAFF_NAME_CACHE.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.name;
+  }
+
+  try {
+    const token = await getLanxinAppToken(account);
+    const gatewayUrl = account.config.gatewayUrl?.replace(/\/+$/, "");
+    if (!gatewayUrl) return null;
+
+    const url = `${gatewayUrl}/v1/staffs/${encodeURIComponent(openId)}/fetch?app_token=${encodeURIComponent(token)}`;
+    const res = await fetch(url);
+    const json = await parseJsonOrThrow<{
+      errCode?: number;
+      errMsg?: string;
+      data?: { name?: string };
+    }>(res, "蓝信 fetchStaffInfo");
+
+    if (json.errCode !== 0 || !json.data?.name) {
+      return null;
+    }
+
+    STAFF_NAME_CACHE.set(key, {
+      name: json.data.name,
+      expiresAt: Date.now() + STAFF_NAME_CACHE_TTL_MS,
+    });
+    return json.data.name;
+  } catch {
+    return null;
+  }
 }

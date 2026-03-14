@@ -21,3 +21,5 @@ https://openapi.lanxin.cn/#/server-api/callback/pushcallback/callback_api
 在（1）中 openclaw 启动后需要链接[远端服务]，保持一个长连接；lanxin-server在回调的时候可以请求 [远端服务] 的callback API，然后[远端服务]异步的在把消息推送给 local openclaw
 
 在（2）中 [本地服务]和[远端服务]要先启动，启动后[本地服务]会和[远端服务]保持一个长连接; openclaw中lanxin plugin的逻辑基本不变，当lanxin-server有消息要推送的时候，调用的是[远端服务]的callback API,然后[远端服务]再推送给[本地服务]，[本地服务]最后再调用openclaw/lanxin
+
+最后不管是本地服务还是远端服务都需要使用golang语言来构建，openclaw plugin需要使用ts语言构建（保持openclaw的规范）

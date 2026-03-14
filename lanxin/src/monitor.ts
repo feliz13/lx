@@ -14,7 +14,7 @@ import {
   resolveMentionGatingWithBypass,
 } from "openclaw/plugin-sdk";
 import { resolveLanxinAccount } from "./accounts.js";
-import { fetchLanxinMedia, getLanxinAppToken } from "./api.js";
+import { fetchLanxinMedia, fetchLanxinStaffName, getLanxinAppToken } from "./api.js";
 import { decryptLanxinPayload, verifyLanxinSignature } from "./crypto.js";
 import { parseLanxinMediaTags } from "./media-tags.js";
 import { getLanxinRuntime } from "./runtime.js";
@@ -556,14 +556,20 @@ async function processLanxinEvent(evt: LanxinCallbackEvent, target: WebhookTarge
     dispatcherOptions: {
       ...prefixOptions,
       deliver: async (payload) => {
-        const text = payload.text ?? "";
+        let text = payload.text ?? "";
         const to = isGroup ? `group:${spaceId}` : spaceId;
         if (!text.trim()) {
           logVerbose(core, runtime, `deliver skip empty text`);
           return;
         }
 
-        // 解析 <lximg> <lxfile> 标签，按顺序发送文本和媒体
+        if (isGroup && senderId) {
+          const senderName = await fetchLanxinStaffName({ account, openId: senderId });
+          if (senderName) {
+            text = `@${senderName} ${text}`;
+          }
+        }
+
         const queue = parseLanxinMediaTags(text);
         if (queue && queue.length > 0) {
           runtime.log?.(
